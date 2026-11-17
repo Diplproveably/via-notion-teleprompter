@@ -1,0 +1,360 @@
+// ==UserScript==
+// @name         Notion 提词器模式
+// @namespace    https://viayoo.com/
+// @version      3.0.0
+// @description  纯文本提词、左右镜像、字号滑块、屏蔽编辑界面、防息屏
+// @author       You
+// @run-at       document-start
+// @match        https://app.notion.com/*
+// @match        https://notion.com/*
+// @match        https://www.notion.com/*
+// @match        https://notion.so/*
+// @match        https://www.notion.so/*
+// @match        https://*.notion.so/*
+// @match        https://notion.site/*
+// @match        https://www.notion.site/*
+// @match        https://*.notion.site/*
+// @grant        none
+// @noframes
+// ==/UserScript==
+
+(function () {
+    'use strict';
+    if (window.top !== window.self) return;
+    const HOST_ID = 'via-notion-teleprompter-v3';
+    const ACTIVE_ATTR = 'data-via-teleprompter-v3';
+    const FONT_KEY = 'via-notion-teleprompter-font-size';
+    const HIDE_AFTER = 4000;
+
+    function mount() {
+        if (!document.documentElement) {
+            setTimeout(mount, 30);
+            return;
+        }
+        if (document.getElementById(HOST_ID)) return;
+
+        let active = false, session = 0, saved = null;
+        let hideTimer = 0, dragging = false, fontSize = 32;
+        let wakeLock = null, pendingWake = null;
+        try {
+            const stored = Number(localStorage.getItem(FONT_KEY));
+            if (stored >= 16 && stored <= 96) fontSize = Math.round(stored);
+        } catch (_) {}
+
+        const host = document.createElement('div');
+        host.id = HOST_ID;
+        host.contentEditable = 'false';
+        host.style.cssText =
+            'all:initial!important;position:fixed!important;inset:0!important;' +
+            'z-index:2147483647!important;pointer-events:none!important;' +
+            'display:block!important;transform:none!important;';
+        const shadow = host.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+            <style>
+                :host { --font-size: 32px; color-scheme: dark; }
+                * { box-sizing: border-box; }
+                [hidden] { display: none !important; }
+                button, input { font: 16px system-ui, sans-serif; }
+                button {
+                    border: 1px solid #666; border-radius: 9px;
+                    padding: 10px 13px; background: #222; color: #fff;
+                    cursor: pointer; touch-action: manipulation;
+                }
+                #enter {
+                    position: fixed; right: 18px; bottom: 80px;
+                    pointer-events: auto; border-radius: 50%;
+                    width: 58px; height: 58px; padding: 0;
+                    background: #111; box-shadow: 0 2px 12px #0006;
+                }
+                #screen {
+                    position: fixed; inset: 0; background: #000;
+                    color: #fff; pointer-events: auto;
+                    font-family: Arial, "Noto Sans SC", sans-serif;
+                }
+                #reader {
+                    width: 100%; height: 100%; overflow: auto;
+                    overscroll-behavior: contain; touch-action: pan-y;
+                    scrollbar-width: none; outline: none;
+                    user-select: none; -webkit-user-select: none;
+                    -webkit-touch-callout: none; cursor: default;
+                }
+                #reader::-webkit-scrollbar { display: none; }
+                #text {
+                    margin: 0 auto; max-width: 1200px;
+                    padding: max(28px, env(safe-area-inset-top))
+                             max(24px, env(safe-area-inset-left), env(safe-area-inset-right))
+                             55vh;
+                    white-space: pre-wrap; overflow-wrap: anywhere;
+                    font-size: var(--font-size); line-height: 1.65;
+                    font-weight: 400; color: #fff; background: #000;
+                    transform: scaleX(-1); transform-origin: center;
+                }
+                #controls {
+                    position: absolute; left: 12px; right: 12px;
+                    bottom: max(12px, env(safe-area-inset-bottom));
+                    margin: auto; max-width: 720px;
+                    padding: 12px; border: 1px solid #555;
+                    border-radius: 12px; background: #151515;
+                    color: #fff; font: 14px/1.5 system-ui, sans-serif;
+                    user-select: none; -webkit-user-select: none;
+                    -webkit-touch-callout: none;
+                }
+                #row { display: flex; align-items: center; gap: 10px; }
+                #size { flex: 1; min-width: 40px; height: 36px; accent-color: #fff; }
+                #size-value { min-width: 42px; text-align: center; }
+                #actions {
+                    display: flex; align-items: center; gap: 8px;
+                    margin-top: 8px;
+                }
+                #wake-status { flex: 1; color: #bbb; font-size: 12px; }
+                #hint { margin-top: 9px; color: #bbb; font-size: 12px; }
+            </style>
+            <button id="enter" type="button" aria-label="进入提词模式">提词</button>
+            <section id="screen" hidden aria-label="提词模式">
+                <div id="reader" tabindex="0" role="document">
+                    <div id="text"></div>
+                </div>
+                <section id="controls" aria-label="提词控制">
+                    <div id="row">
+                        <label for="size">字号</label>
+                        <input id="size" type="range" min="16" max="96" step="1">
+                        <output id="size-value" for="size"></output>
+                    </div>
+                    <div id="actions">
+                        <span id="wake-status"></span>
+                        <button id="hide" type="button">隐藏</button>
+                        <button id="exit" type="button">退出</button>
+                    </div>
+                    <div id="hint">闲置 4 秒后隐藏。双击正文，再显示控制条。</div>
+                </section>
+            </section>
+        `;
+        const get = id => shadow.getElementById(id);
+        const enterButton = get('enter'), screen = get('screen');
+        const reader = get('reader'), text = get('text');
+        const controls = get('controls'), size = get('size');
+        const value = get('size-value'), wakeStatus = get('wake-status');
+        size.value = String(fontSize);
+        value.textContent = fontSize + 'px';
+        host.style.setProperty('--font-size', fontSize + 'px');
+
+        const isolation = document.createElement('style');
+        isolation.textContent =
+            'html[' + ACTIVE_ATTR + '] {overflow:hidden!important;background:#000!important;}' +
+            'html[' + ACTIVE_ATTR + '] > body {display:none!important;}' +
+            'html[' + ACTIVE_ATTR + '] > body * {visibility:hidden!important;pointer-events:none!important;}';
+        document.documentElement.append(isolation, host);
+
+        function scheduleHide() {
+            clearTimeout(hideTimer);
+            if (active && !dragging) {
+                hideTimer = setTimeout(hideControls, HIDE_AFTER);
+            }
+        }
+        function hideControls() {
+            if (dragging) return;
+            clearTimeout(hideTimer);
+            controls.hidden = true;
+            if (active) reader.focus({ preventScroll: true });
+        }
+        function showControls() {
+            if (!active) return;
+            controls.hidden = false;
+            scheduleHide();
+        }
+
+        async function requestWakeLock() {
+            if (!active || wakeLock || pendingWake !== null ||
+                document.visibilityState !== 'visible') return;
+            if (!navigator.wakeLock) {
+                wakeStatus.textContent = '常亮：浏览器不支持';
+                return;
+            }
+            const token = session;
+            pendingWake = token;
+            try {
+                const lock = await navigator.wakeLock.request('screen');
+                if (!active || session !== token) {
+                    await lock.release();
+                    return;
+                }
+                wakeLock = lock;
+                wakeStatus.textContent = '常亮：已开启';
+                lock.addEventListener('release', () => {
+                    if (wakeLock !== lock) return;
+                    wakeLock = null;
+                    wakeStatus.textContent = '常亮：已释放，点正文重试';
+                });
+            } catch (_) {
+                if (active && session === token) {
+                    wakeStatus.textContent = '常亮：申请失败，点正文重试';
+                }
+            } finally {
+                if (pendingWake === token) pendingWake = null;
+            }
+        }
+
+        function enter() {
+            if (active || !document.body) return;
+            const roots = Array.from(document.querySelectorAll('.notion-page-content'))
+                .filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    const css = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        css.visibility !== 'hidden' && css.display !== 'none';
+                });
+            const source = roots.find(el => el.contains(document.activeElement)) ||
+                roots[roots.length - 1];
+            // 先读取已显示正文，再隐藏原页面。保留顺序和换行。
+            const content = source ? source.innerText : '';
+            if (!content.trim()) {
+                alert('未找到正文。等笔记加载后，再点“提词”。');
+                return;
+            }
+            const scrolls = [];
+            for (let el = source; el; el = el.parentElement) {
+                if (el.scrollTop || el.scrollLeft) {
+                    scrolls.push([el, el.scrollLeft, el.scrollTop]);
+                }
+            }
+            saved = {
+                body: document.body,
+                inert: document.body.getAttribute('inert'),
+                attr: document.documentElement.getAttribute(ACTIVE_ATTR),
+                scrolls, x: window.scrollX, y: window.scrollY
+            };
+            document.activeElement?.blur?.();
+            window.getSelection()?.removeAllRanges();
+            text.textContent = content;
+            active = true;
+            session += 1;
+            saved.body.setAttribute('inert', '');
+            document.documentElement.setAttribute(ACTIVE_ATTR, '');
+            enterButton.hidden = true;
+            screen.hidden = false;
+            reader.scrollTop = 0;
+            reader.focus({ preventScroll: true });
+            wakeStatus.textContent = '常亮：正在申请';
+            showControls();
+            requestWakeLock();
+        }
+
+        function exit() {
+            if (!active) return;
+            active = false;
+            session += 1;
+            pendingWake = null;
+            clearTimeout(hideTimer);
+            dragging = false;
+            screen.hidden = true;
+            enterButton.hidden = false;
+            text.textContent = '';
+            const old = saved;
+            saved = null;
+            if (old.inert === null) old.body.removeAttribute('inert');
+            else old.body.setAttribute('inert', old.inert);
+            if (old.attr === null) document.documentElement.removeAttribute(ACTIVE_ATTR);
+            else document.documentElement.setAttribute(ACTIVE_ATTR, old.attr);
+            const lock = wakeLock;
+            wakeLock = null;
+            if (lock) lock.release().catch(() => {});
+            const restoreToken = session;
+            requestAnimationFrame(() => {
+                if (active || session !== restoreToken) return;
+                window.scrollTo(old.x, old.y);
+                old.scrolls.forEach(([el, x, y]) => el.scrollTo(x, y));
+            });
+        }
+
+        enterButton.addEventListener('click', enter);
+        get('exit').addEventListener('click', exit);
+        get('hide').addEventListener('click', hideControls);
+        size.addEventListener('input', () => {
+            const range = reader.scrollHeight - reader.clientHeight;
+            const ratio = range > 0 ? reader.scrollTop / range : 0;
+            fontSize = Number(size.value);
+            host.style.setProperty('--font-size', fontSize + 'px');
+            value.textContent = fontSize + 'px';
+            reader.scrollTop = ratio * (reader.scrollHeight - reader.clientHeight);
+            try { localStorage.setItem(FONT_KEY, String(fontSize)); } catch (_) {}
+            scheduleHide();
+        });
+        controls.addEventListener('pointerdown', () => {
+            dragging = true;
+            clearTimeout(hideTimer);
+        });
+        const endDrag = () => {
+            dragging = false;
+            scheduleHide();
+        };
+        window.addEventListener('pointerup', endDrag, true);
+        window.addEventListener('pointercancel', endDrag, true);
+        controls.addEventListener('keydown', scheduleHide);
+
+        // 普通触摸只滚动正文。双击才显示控制条。
+        let press = null, lastTap = null;
+        reader.addEventListener('pointerdown', e => {
+            requestWakeLock();
+            press = { id: e.pointerId, x: e.clientX, y: e.clientY,
+                time: performance.now(), scroll: reader.scrollTop };
+        });
+        reader.addEventListener('pointercancel', () => {
+            press = lastTap = null;
+        });
+        reader.addEventListener('pointerup', e => {
+            const down = press;
+            press = null;
+            const now = performance.now();
+            if (!down || down.id !== e.pointerId || e.pointerType === 'mouse' ||
+                now - down.time > 350 ||
+                Math.hypot(e.clientX - down.x, e.clientY - down.y) > 16 ||
+                Math.abs(reader.scrollTop - down.scroll) > 8) {
+                lastTap = null;
+                return;
+            }
+            if (lastTap && now - lastTap.time < 350 &&
+                Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 32) {
+                showControls();
+                lastTap = null;
+            } else {
+                lastTap = { time: now, x: e.clientX, y: e.clientY };
+            }
+        });
+        reader.addEventListener('dblclick', e => {
+            e.preventDefault();
+            showControls();
+        });
+        ['contextmenu', 'selectstart', 'dragstart'].forEach(type => {
+            reader.addEventListener(type, e => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        });
+        ['click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu'].forEach(type => {
+            shadow.addEventListener(type, e => e.stopPropagation());
+        });
+
+        // 提词模式拦截 Notion 快捷键，保留滚动和滑块按键。
+        ['keydown', 'keypress', 'keyup', 'beforeinput', 'paste'].forEach(type => {
+            window.addEventListener(type, e => {
+                if (!active) return;
+                const path = e.composedPath();
+                if (path.includes(controls)) scheduleHide();
+                e.stopImmediatePropagation();
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    exit();
+                } else if (e.ctrlKey || e.metaKey || type === 'beforeinput' ||
+                    type === 'paste') {
+                    e.preventDefault();
+                }
+            }, true);
+        });
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') requestWakeLock();
+        });
+        window.addEventListener('pagehide', exit);
+        window.addEventListener('popstate', exit);
+    }
+    mount();
+})();
