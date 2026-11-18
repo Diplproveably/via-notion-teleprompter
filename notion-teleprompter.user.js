@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Notion 提词器模式
 // @namespace    https://viayoo.com/
-// @version      3.0.0
-// @description  纯文本提词、左右镜像、字号滑块、屏蔽编辑界面、防息屏
+// @version      3.1.0
+// @description  Notion 正文实时同步、纯文本提词、左右镜像、字号滑块、防误触、防息屏
 // @author       You
 // @run-at       document-start
 // @match        https://app.notion.com/*
@@ -36,6 +36,8 @@
         let active = false, session = 0, saved = null;
         let hideTimer = 0, dragging = false, fontSize = 32;
         let wakeLock = null, pendingWake = null;
+        let source = null, latestContent = '';
+        let contentObserver = null, structureObserver = null, syncTimer = 0;
         try {
             const stored = Number(localStorage.getItem(FONT_KEY));
             if (stored >= 16 && stored <= 96) fontSize = Math.round(stored);
@@ -139,11 +141,78 @@
         host.style.setProperty('--font-size', fontSize + 'px');
 
         const isolation = document.createElement('style');
+        // 保留 Notion 渲染和远程同步，使用不透明提词层隔离其界面。
         isolation.textContent =
             'html[' + ACTIVE_ATTR + '] {overflow:hidden!important;background:#000!important;}' +
-            'html[' + ACTIVE_ATTR + '] > body {display:none!important;}' +
-            'html[' + ACTIVE_ATTR + '] > body * {visibility:hidden!important;pointer-events:none!important;}';
+            'html[' + ACTIVE_ATTR + '] > body {' +
+                'pointer-events:none!important;user-select:none!important;' +
+                '-webkit-user-select:none!important;' +
+            '}';
         document.documentElement.append(isolation, host);
+
+        function findSource() {
+            const roots = Array.from(document.querySelectorAll('.notion-page-content'))
+                .filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    const css = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        css.visibility !== 'hidden' && css.display !== 'none';
+                });
+            return roots.find(el => el.contains(document.activeElement)) ||
+                roots[roots.length - 1] || null;
+        }
+
+        function watchSource(next) {
+            if (contentObserver) contentObserver.disconnect();
+            source = next;
+            if (source) {
+                contentObserver = new MutationObserver(scheduleSync);
+                contentObserver.observe(source, {
+                    childList: true, characterData: true, subtree: true
+                });
+            }
+        }
+
+        function syncFromNotion() {
+            syncTimer = 0;
+            if (!active) return;
+            if (!source || !source.isConnected) {
+                const next = findSource();
+                if (!next) return;
+                watchSource(next);
+            }
+            const nextContent = source.innerText;
+            if (nextContent === latestContent) return;
+            const top = reader.scrollTop;
+            text.textContent = nextContent;
+            latestContent = nextContent;
+            reader.scrollTop = top;
+        }
+
+        function scheduleSync() {
+            if (!active || syncTimer) return;
+            syncTimer = setTimeout(syncFromNotion, 200);
+        }
+
+        function startSync(root) {
+            watchSource(root);
+            structureObserver = new MutationObserver(() => {
+                if (active && (!source || !source.isConnected)) scheduleSync();
+            });
+            structureObserver.observe(document.body, {
+                childList: true, subtree: true
+            });
+        }
+
+        function stopSync() {
+            clearTimeout(syncTimer);
+            syncTimer = 0;
+            if (contentObserver) contentObserver.disconnect();
+            if (structureObserver) structureObserver.disconnect();
+            contentObserver = structureObserver = null;
+            source = null;
+            latestContent = '';
+        }
 
         function scheduleHide() {
             clearTimeout(hideTimer);
@@ -196,16 +265,8 @@
 
         function enter() {
             if (active || !document.body) return;
-            const roots = Array.from(document.querySelectorAll('.notion-page-content'))
-                .filter(el => {
-                    const rect = el.getBoundingClientRect();
-                    const css = getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 &&
-                        css.visibility !== 'hidden' && css.display !== 'none';
-                });
-            const source = roots.find(el => el.contains(document.activeElement)) ||
-                roots[roots.length - 1];
-            // 先读取已显示正文，再隐藏原页面。保留顺序和换行。
+            const source = findSource();
+            // 先读取已显示正文，后续改动由 MutationObserver 同步。
             const content = source ? source.innerText : '';
             if (!content.trim()) {
                 alert('未找到正文。等笔记加载后，再点“提词”。');
@@ -226,9 +287,11 @@
             document.activeElement?.blur?.();
             window.getSelection()?.removeAllRanges();
             text.textContent = content;
+            latestContent = content;
             active = true;
             session += 1;
             saved.body.setAttribute('inert', '');
+            startSync(source);
             document.documentElement.setAttribute(ACTIVE_ATTR, '');
             enterButton.hidden = true;
             screen.hidden = false;
@@ -245,6 +308,7 @@
             session += 1;
             pendingWake = null;
             clearTimeout(hideTimer);
+            stopSync();
             dragging = false;
             screen.hidden = true;
             enterButton.hidden = false;
@@ -351,8 +415,12 @@
             }, true);
         });
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible') requestWakeLock();
+            if (document.visibilityState === 'visible') {
+                requestWakeLock();
+                scheduleSync();
+            }
         });
+        window.addEventListener('focus', scheduleSync);
         window.addEventListener('pagehide', exit);
         window.addEventListener('popstate', exit);
     }
