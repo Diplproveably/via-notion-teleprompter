@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Notion 提词器模式
 // @namespace    https://viayoo.com/
-// @version      3.1.0
-// @description  Notion 正文实时同步、纯文本提词、左右镜像、字号滑块、防误触、防息屏
+// @version      3.2.0
+// @description  Notion 正文与格式同步、富文本提词、左右镜像、字号滑块、防误触、防息屏
 // @author       You
 // @run-at       document-start
 // @match        https://app.notion.com/*
@@ -36,8 +36,8 @@
         let active = false, session = 0, saved = null;
         let hideTimer = 0, dragging = false, fontSize = 32;
         let wakeLock = null, pendingWake = null;
-        let source = null, latestContent = '';
-        let contentObserver = null, structureObserver = null, syncTimer = 0;
+        let source = null, syncObserver = null, syncTimer = 0;
+        let visibleRoots = [];
         try {
             const stored = Number(localStorage.getItem(FONT_KEY));
             if (stored >= 16 && stored <= 96) fontSize = Math.round(stored);
@@ -150,68 +150,136 @@
             '}';
         document.documentElement.append(isolation, host);
 
+        const rootSelector = '.notion-page-content';
+        const skipSelector = 'script,style,template,noscript,svg,canvas,iframe,' +
+            'img,video,audio,button,input,select,textarea';
+
         function findSource() {
-            const roots = Array.from(document.querySelectorAll('.notion-page-content'))
+            const roots = Array.from(document.querySelectorAll(rootSelector))
                 .filter(el => {
                     const rect = el.getBoundingClientRect();
-                    const css = getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 &&
-                        css.visibility !== 'hidden' && css.display !== 'none';
+                    return !el.closest('[aria-hidden="true"],[hidden]') &&
+                        rect.width > 0 && rect.height > 0 &&
+                        getComputedStyle(el).visibility === 'visible';
                 });
+            const added = roots.filter(el => !visibleRoots.includes(el));
+            visibleRoots = roots;
             return roots.find(el => el.contains(document.activeElement)) ||
+                added[added.length - 1] || (roots.includes(source) && source) ||
                 roots[roots.length - 1] || null;
         }
 
-        function watchSource(next) {
-            if (contentObserver) contentObserver.disconnect();
-            source = next;
-            if (source) {
-                contentObserver = new MutationObserver(scheduleSync);
-                contentObserver.observe(source, {
-                    childList: true, characterData: true, subtree: true
-                });
+        // 只复制文字、换行和文字样式，链接与编辑控件留在原页。
+        function readContent(root) {
+            const fragment = document.createDocumentFragment();
+            function copyElement(el, parent, parentUnderline, parentStrike) {
+                if (el.matches(skipSelector) || el.hidden) return;
+                const css = getComputedStyle(el);
+                if (css.display === 'none' || css.visibility !== 'visible' ||
+                    css.contentVisibility === 'hidden') return;
+                if (el.tagName === 'BR') {
+                    parent.append(document.createElement('br'));
+                    return;
+                }
+
+                const block = el !== root &&
+                    /^(block|flow-root|flex|grid|list-item|table|table-row)$/.test(css.display);
+                if (css.display === 'table-cell' && el.previousElementSibling) {
+                    parent.append('\t');
+                }
+                const target = block ? document.createElement('div') : parent;
+                const underline = parentUnderline || css.textDecorationLine.includes('underline') ||
+                    (css.display === 'inline' && parseFloat(css.borderBottomWidth) > 0);
+                const strike = parentStrike || css.textDecorationLine.includes('line-through');
+                const lines = [underline && 'underline', strike && 'line-through']
+                    .filter(Boolean).join(' ');
+                const bold = Number(css.fontWeight) >= 600;
+                const italic = /^(italic|oblique)/.test(css.fontStyle);
+                for (const node of el.childNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        copyElement(node, target, underline, strike);
+                    } else if (node.nodeType === Node.TEXT_NODE && node.data) {
+                        let value = node.data;
+                        if (css.whiteSpace === 'normal' || css.whiteSpace === 'nowrap') {
+                            value = value.replace(/[ \t\r\n\f]+/g, ' ');
+                        }
+                        if (bold || italic || lines) {
+                            const span = document.createElement('span');
+                            if (bold) span.style.fontWeight = '700';
+                            if (italic) span.style.fontStyle = 'italic';
+                            if (lines) span.style.textDecorationLine = lines;
+                            span.textContent = value;
+                            target.append(span);
+                        } else {
+                            target.append(value);
+                        }
+                    }
+                }
+                if (!el.hasChildNodes() && el.matches('[contenteditable="true"],[data-content-editable-leaf]')) {
+                    target.append(document.createElement('br'));
+                }
+                if (block && target.hasChildNodes()) parent.append(target);
             }
+            if (root) copyElement(root, fragment, false, false);
+            return fragment;
         }
 
         function syncFromNotion() {
             syncTimer = 0;
             if (!active) return;
-            if (!source || !source.isConnected) {
-                const next = findSource();
-                if (!next) return;
-                watchSource(next);
-            }
-            const nextContent = source.innerText;
-            if (nextContent === latestContent) return;
+            source = findSource();
+            const content = readContent(source);
+            if (text.childNodes.length === content.childNodes.length &&
+                Array.from(content.childNodes).every((node, i) =>
+                    node.isEqualNode(text.childNodes[i]))) return;
             const top = reader.scrollTop;
-            text.textContent = nextContent;
-            latestContent = nextContent;
+            text.replaceChildren(content);
             reader.scrollTop = top;
         }
 
         function scheduleSync() {
-            if (!active || syncTimer) return;
-            syncTimer = setTimeout(syncFromNotion, 200);
+            if (active && !syncTimer) syncTimer = setTimeout(syncFromNotion, 150);
         }
 
-        function startSync(root) {
-            watchSource(root);
-            structureObserver = new MutationObserver(() => {
-                if (active && (!source || !source.isConnected)) scheduleSync();
+        function startSync() {
+            // Notion 切页时可能保留旧正文，也可能替换整个容器。
+            syncObserver = new MutationObserver(records => {
+                if (syncTimer) return;
+                for (const record of records) {
+                    const target = record.target;
+                    const el = target.nodeType === Node.ELEMENT_NODE ? target : target.parentElement;
+                    if (el?.closest(rootSelector) || (source && el?.contains(source))) {
+                        scheduleSync();
+                        return;
+                    }
+                    if (record.type === 'characterData') continue;
+                    if (record.type === 'attributes') {
+                        if (visibleRoots.includes(target) || target.querySelector(rootSelector)) {
+                            scheduleSync();
+                            return;
+                        }
+                    } else {
+                        const nodes = [...record.addedNodes, ...record.removedNodes];
+                        if (!source?.isConnected || nodes.some(node =>
+                            node.nodeType === Node.ELEMENT_NODE &&
+                            (node.matches(rootSelector) || node.querySelector(rootSelector)))) {
+                            scheduleSync();
+                            return;
+                        }
+                    }
+                }
             });
-            structureObserver.observe(document.body, {
-                childList: true, subtree: true
+            syncObserver.observe(document.documentElement, {
+                childList: true, characterData: true, attributes: true, subtree: true
             });
         }
 
         function stopSync() {
             clearTimeout(syncTimer);
             syncTimer = 0;
-            if (contentObserver) contentObserver.disconnect();
-            if (structureObserver) structureObserver.disconnect();
-            contentObserver = structureObserver = null;
-            source = null;
-            latestContent = '';
+            syncObserver?.disconnect();
+            syncObserver = source = null;
+            visibleRoots = [];
         }
 
         function scheduleHide() {
@@ -265,10 +333,9 @@
 
         function enter() {
             if (active || !document.body) return;
-            const source = findSource();
-            // 先读取已显示正文，后续改动由 MutationObserver 同步。
-            const content = source ? source.innerText : '';
-            if (!content.trim()) {
+            source = findSource();
+            const content = readContent(source);
+            if (!content.textContent.trim()) {
                 alert('未找到正文。等笔记加载后，再点“提词”。');
                 return;
             }
@@ -286,12 +353,11 @@
             };
             document.activeElement?.blur?.();
             window.getSelection()?.removeAllRanges();
-            text.textContent = content;
-            latestContent = content;
+            text.replaceChildren(content);
             active = true;
             session += 1;
             saved.body.setAttribute('inert', '');
-            startSync(source);
+            startSync();
             document.documentElement.setAttribute(ACTIVE_ATTR, '');
             enterButton.hidden = true;
             screen.hidden = false;
@@ -421,6 +487,7 @@
             }
         });
         window.addEventListener('focus', scheduleSync);
+        window.addEventListener('resize', scheduleSync);
         window.addEventListener('pagehide', exit);
         window.addEventListener('popstate', exit);
     }
