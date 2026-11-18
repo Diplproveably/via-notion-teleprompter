@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         Notion 提词器模式
 // @namespace    https://viayoo.com/
-// @version      3.2.0
+// @version      3.3.0
 // @description  Notion 正文与格式同步、富文本提词、左右镜像、字号滑块、防误触、防息屏
+// @updateURL    https://raw.githubusercontent.com/Diplproveably/via-notion-teleprompter/main/notion-teleprompter.user.js
+// @downloadURL  https://raw.githubusercontent.com/Diplproveably/via-notion-teleprompter/main/notion-teleprompter.user.js
 // @author       You
 // @run-at       document-start
 // @match        https://app.notion.com/*
@@ -38,6 +40,8 @@
         let wakeLock = null, pendingWake = null;
         let source = null, syncObserver = null, syncTimer = 0;
         let visibleRoots = [];
+        let lastLocal = null, lastRemote = null;
+        let request = null, cloudTimer = 0, remotePage = '', retryDelay = 0;
         try {
             const stored = Number(localStorage.getItem(FONT_KEY));
             if (stored >= 16 && stored <= 96) fontSize = Math.round(stored);
@@ -127,6 +131,7 @@
                         <button id="hide" type="button">隐藏</button>
                         <button id="exit" type="button">退出</button>
                     </div>
+                    <div>3.3.0 · <span id="sync-status"></span></div>
                     <div id="hint">闲置 4 秒后隐藏。双击正文，再显示控制条。</div>
                 </section>
             </section>
@@ -134,6 +139,7 @@
         const get = id => shadow.getElementById(id);
         const enterButton = get('enter'), screen = get('screen');
         const reader = get('reader'), text = get('text');
+        const syncStatus = get('sync-status');
         const controls = get('controls'), size = get('size');
         const value = get('size-value'), wakeStatus = get('wake-status');
         size.value = String(fontSize);
@@ -170,11 +176,11 @@
         }
 
         // 只复制文字、换行和文字样式，链接与编辑控件留在原页。
-        function readContent(root) {
+        function readContent(root, view = window) {
             const fragment = document.createDocumentFragment();
             function copyElement(el, parent, parentUnderline, parentStrike) {
                 if (el.matches(skipSelector) || el.hidden) return;
-                const css = getComputedStyle(el);
+                const css = view.getComputedStyle(el);
                 if (css.display === 'none' || css.visibility !== 'visible' ||
                     css.contentVisibility === 'hidden') return;
                 if (el.tagName === 'BR') {
@@ -224,11 +230,253 @@
             return fragment;
         }
 
+        function uuid(value) {
+            const hex = (value || '').replace(/-/g, '');
+            if (!/^[a-f0-9]{32}$/i.test(hex)) return '';
+            return hex.toLowerCase().replace(/^(........)(....)(....)(....)(............)$/, '$1-$2-$3-$4-$5');
+        }
+
+        function currentPageId() {
+            const owner = source?.closest('.notion-page-block[data-block-id]');
+            const fromDOM = uuid(owner?.getAttribute('data-block-id'));
+            if (fromDOM) return fromDOM;
+            function fromURL(url) {
+                const pathId = url.pathname.match(/([0-9a-f]{32}|[0-9a-f-]{36})\/?$/i);
+                return uuid(url.searchParams.get('p')) || uuid(pathId?.[1]);
+            }
+            const page = new URL(window.location.href);
+            const canonical = document.querySelector('link[rel="canonical"]')?.href;
+            return fromURL(page) || (canonical && fromURL(new URL(canonical, page))) || '';
+        }
+
+        async function fetchPageBlocks(id, signal) {
+            const blocks = new Map();
+            let cursor = { stack: [] };
+            const seen = new Set();
+            do {
+                const key = JSON.stringify(cursor);
+                if (seen.has(key)) throw Error('分页重复');
+                seen.add(key);
+                const response = await fetch('/api/v3/loadPageChunk', {
+                    method: 'POST', credentials: 'same-origin', cache: 'no-store', signal,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pageId: id, limit: 100, cursor,
+                        chunkNumber: seen.size - 1, verticalColumns: false })
+                });
+                if (!response.ok) throw Error('HTTP ' + response.status);
+                const page = await response.json();
+                if (!page.recordMap?.block) throw Error('未收到正文数据');
+                for (const [key, record] of Object.entries(page.recordMap.block)) {
+                    const outer = record?.value;
+                    const block = outer?.type ? outer : outer?.value;
+                    if (block && record.role !== 'none' && outer.role !== 'none') {
+                        blocks.set(uuid(key), block);
+                    }
+                }
+                cursor = page.cursor;
+            } while (cursor?.stack?.length);
+            return blocks;
+        }
+
+        function cloudContent(id, blocks) {
+            const root = blocks.get(id);
+            if (!root || !Array.isArray(root.content) || !['page', 'collection_view_page'].includes(root.type)) {
+                throw Error('未收到当前页');
+            }
+            const fragment = document.createDocumentFragment();
+            const seen = new Set([id]);
+
+            function appendRuns(line, runs) {
+                for (const [value, marks = []] of runs || []) {
+                    if (typeof value !== 'string' || value.includes('\u2023') || value.includes('\ufffc')) {
+                        throw Error('此页含引用文字');
+                    }
+                    const span = document.createElement('span');
+                    span.textContent = value;
+                    const flags = new Set(marks.map(mark => mark[0]));
+                    if (flags.has('b')) span.style.fontWeight = '700';
+                    if (flags.has('i')) span.style.fontStyle = 'italic';
+                    const lines = [flags.has('u') && 'underline', flags.has('s') && 'line-through'];
+                    if (flags.has('u') || flags.has('s')) span.style.textDecorationLine = lines.filter(Boolean).join(' ');
+                    line.append(span);
+                }
+            }
+            function appendChildren(parent) {
+                let listCount = 0;
+                for (const key of parent.content || []) {
+                    const blockId = uuid(key);
+                    const block = blocks.get(blockId);
+                    if (!block || seen.has(blockId)) throw Error('正文数据不完整');
+                    seen.add(blockId);
+                    if (block.alive === false) continue;
+                    const type = block.type;
+                    const props = block.properties || {};
+                    const line = document.createElement('div');
+                    if (type !== 'numbered_list') listCount = 0;
+                    switch (type) {
+                    case 'numbered_list': line.append(++listCount + '. '); break;
+                    case 'bulleted_list': line.append('• '); break;
+                    case 'to_do': line.append(props.checked?.[0]?.[0] === 'Yes' ? '☑ ' : '☐ '); break;
+                    case 'header': case 'sub_header': case 'sub_sub_header':
+                        line.style.fontWeight = '700';
+                        break;
+                    case 'text': case 'quote': case 'callout': case 'code': break;
+                    case 'column': case 'column_list': case 'table':
+                        appendChildren(block);
+                        continue;
+                    case 'table_row':
+                        if (!parent.format?.table_block_column_order) throw Error('表格缺少列顺序');
+                        parent.format.table_block_column_order.forEach((col, index) => {
+                            if (index) line.append('\t');
+                            appendRuns(line, props[col]);
+                        });
+                        break;
+                    case 'image': case 'video': case 'audio': case 'file': case 'pdf':
+                        if (props.caption) {
+                            appendRuns(line, props.caption);
+                            fragment.append(line);
+                        }
+                        continue;
+                    case 'divider': continue;
+                    default: throw Error('此页含 ' + type + ' 内容块');
+                    }
+                    if (type !== 'table_row') appendRuns(line, props.title);
+                    if (!line.hasChildNodes()) line.append(document.createElement('br'));
+                    fragment.append(line);
+                    appendChildren(block);
+                }
+            }
+            appendChildren(root);
+            return fragment;
+        }
+
+        // 云端接口不可用时，在后台重新打开当前页并等待正文渲染。
+        async function readFreshPage(url, signal) {
+            const frame = document.createElement('iframe');
+            frame.setAttribute('aria-hidden', 'true');
+            frame.tabIndex = -1;
+            frame.style.cssText = 'position:fixed;left:-200vw;top:0;width:100vw;height:100vh;pointer-events:none';
+            frame.src = url;
+            shadow.append(frame);
+            try {
+                const until = Date.now() + 15000;
+                let last = null, stableSince = 0;
+                while (!signal.aborted && Date.now() < until) {
+                    await new Promise(resolve => setTimeout(resolve, 350));
+                    if (signal.aborted) break;
+                    const doc = frame.contentDocument;
+                    if (!doc) throw Error('浏览器禁止后台打开此页');
+                    if (doc.readyState !== 'complete' || doc.URL === 'about:blank') continue;
+                    const loaded = new URL(doc.URL);
+                    const expected = new URL(url);
+                    if (loaded.origin !== expected.origin || loaded.pathname !== expected.pathname ||
+                        loaded.search !== expected.search) throw Error('后台页面地址已变更');
+                    const roots = [...doc.querySelectorAll(rootSelector)].filter(el =>
+                        el.getBoundingClientRect().width && !el.closest('[hidden],[aria-hidden="true"]'));
+                    if (!roots.length) continue;
+                    const content = readContent(roots[roots.length - 1], frame.contentWindow);
+                    if (!content.textContent.trim()) continue;
+                    if (!last || !last.isEqualNode(content)) {
+                        last = content;
+                        stableSince = Date.now();
+                    } else if (Date.now() - stableSince >= 1000) {
+                        return content;
+                    }
+                }
+                throw Error('后台页面未返回正文');
+            } finally {
+                frame.remove();
+            }
+        }
+
+        function pageKey() {
+            return window.location.href + '|' + currentPageId();
+        }
+
+        function cancelCloud() {
+            clearTimeout(cloudTimer);
+            request?.abort();
+            request = null;
+            remotePage = '';
+            lastRemote = null;
+        }
+
+        function queueCloud(delay) {
+            clearTimeout(cloudTimer);
+            if (active && !document.hidden) cloudTimer = setTimeout(pollCloud, delay);
+        }
+
+        async function pollCloud() {
+            if (!active || request || document.hidden) return;
+            const id = currentPageId(), key = pageKey(), url = window.location.href;
+            const controller = new AbortController();
+            request = controller;
+            const stillCurrent = () => active && request === controller && pageKey() === key;
+            let delay = 5000, timeout = 0;
+            try {
+                let content, label;
+                try {
+                    if (!id) throw Error('未找到页面 ID');
+                    const api = new AbortController();
+                    const abortApi = () => api.abort();
+                    controller.signal.addEventListener('abort', abortApi, { once: true });
+                    try {
+                        timeout = setTimeout(abortApi, 12000);
+                        content = cloudContent(id, await fetchPageBlocks(id, api.signal));
+                    } finally {
+                        clearTimeout(timeout);
+                        controller.signal.removeEventListener('abort', abortApi);
+                    }
+                    label = '已读取云端';
+                } catch (error) {
+                    if (!stillCurrent()) return;
+                    const reason = error.name === 'AbortError' ? '请求超时' : error.message;
+                    syncStatus.textContent = '云端读取失败（' + reason + '），正在后台打开页面';
+                    try {
+                        content = await readFreshPage(url, controller.signal);
+                    } catch (frameError) {
+                        throw Error(reason + ' / ' + frameError.message);
+                    }
+                    label = '已重读网页';
+                    delay = 30000;
+                }
+                if (!stillCurrent()) return;
+                if (remotePage !== key || !lastRemote?.isEqualNode(content)) {
+                    lastRemote = content.cloneNode(true);
+                    displayContent(content);
+                }
+                remotePage = key;
+                retryDelay = 0;
+                syncStatus.textContent = label + ' ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+            } catch (error) {
+                if (!stillCurrent()) return;
+                syncStatus.textContent = '自动读取失败（' + error.message + '），稍后重试';
+                retryDelay = Math.min(120000, Math.max(15000, retryDelay * 2));
+                delay = retryDelay;
+            } finally {
+                if (request === controller) {
+                    request = null;
+                    queueCloud(pageKey() === key ? delay : 0);
+                }
+            }
+        }
+
         function syncFromNotion() {
             syncTimer = 0;
             if (!active) return;
             source = findSource();
+            if (remotePage && remotePage !== pageKey()) {
+                cancelCloud();
+                lastLocal = null;
+                queueCloud(0);
+            }
             const content = readContent(source);
+            if (lastLocal?.isEqualNode(content)) return;
+            lastLocal = content.cloneNode(true);
+            displayContent(content);
+        }
+
+        function displayContent(content) {
             if (text.childNodes.length === content.childNodes.length &&
                 Array.from(content.childNodes).every((node, i) =>
                     node.isEqualNode(text.childNodes[i]))) return;
@@ -353,10 +601,14 @@
             };
             document.activeElement?.blur?.();
             window.getSelection()?.removeAllRanges();
+            lastLocal = content.cloneNode(true);
             text.replaceChildren(content);
             active = true;
             session += 1;
             saved.body.setAttribute('inert', '');
+            retryDelay = 0;
+            syncStatus.textContent = '正在读取云端';
+            queueCloud(0);
             startSync();
             document.documentElement.setAttribute(ACTIVE_ATTR, '');
             enterButton.hidden = true;
@@ -374,6 +626,8 @@
             session += 1;
             pendingWake = null;
             clearTimeout(hideTimer);
+            cancelCloud();
+            lastLocal = null;
             stopSync();
             dragging = false;
             screen.hidden = true;
@@ -484,6 +738,7 @@
             if (document.visibilityState === 'visible') {
                 requestWakeLock();
                 scheduleSync();
+                queueCloud(0);
             }
         });
         window.addEventListener('focus', scheduleSync);
